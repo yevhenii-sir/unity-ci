@@ -1,0 +1,269 @@
+name: Release
+
+# Reusable release workflow for Unity projects, called from a project's own release.yml.
+# Builds on the shared unity-builder service on RunPod; settings come from the project's
+# .github/unity-ci.json.
+# Release: bumps the version (X.Y.Z -> code X*1000000 + Y*1000 + Z), commits it, tags
+# vX.Y.Z and builds that tag.
+#   Android: the builder attaches the build to the GitHub Release of the tag and uploads
+#   the AAB to Google Play when the project has a play_script.
+#   iOS: the builder exports the Xcode project; the Mac builds, signs and uploads it to
+#   App Store Connect / TestFlight (scripts/ios_archive.sh).
+# Debug (Android only): an APK of the current version without a version commit, tagged
+# vX.Y.Z-debug.N and attached to a prerelease for testers.
+# Jobs run on the caller's Mac runners with its GITHUB_TOKEN (contents: write) and secrets.
+on:
+  workflow_call:
+    inputs:
+      platform:
+        type: string
+        default: android
+      config:
+        type: string
+        default: Release
+      bump:
+        type: string
+        default: patch
+      version:
+        type: string
+        default: ""
+      play_upload:
+        type: boolean
+        default: true
+      track:
+        type: string
+        default: internal
+      status:
+        type: string
+        default: draft
+      # A reusable workflow cannot see the ref it was called at, so the scripts come from
+      # this ref; set it with a matching @ref when testing a branch.
+      unity_ci_ref:
+        type: string
+        default: v1
+
+jobs:
+  version:
+    runs-on: [self-hosted, macOS]
+    outputs:
+      unity: ${{ steps.unity.outputs.version }}
+      team_id: ${{ steps.project.outputs.team_id }}
+      tag: ${{ steps.tag.outputs.tag }}
+      code: ${{ steps.version.outputs.code }}
+    steps:
+      # Only the settings are needed here; the builder clones the tag.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            ProjectSettings
+            .github
+
+      - uses: actions/checkout@v4
+        with:
+          repository: yevhenii-sir/unity-ci
+          ref: ${{ inputs.unity_ci_ref }}
+          path: .unity-ci
+          sparse-checkout: scripts
+
+      - name: Project
+        id: project
+        env:
+          PLATFORM: ${{ inputs.platform }}
+          CONFIG: ${{ inputs.config }}
+        run: python3 .unity-ci/scripts/project.py .github/unity-ci.json "$PLATFORM" "$CONFIG"
+
+      - name: Unity version
+        id: unity
+        run: |
+          echo "version=$(sed -n 's/^m_EditorVersion: //p' ProjectSettings/ProjectVersion.txt)" >> "$GITHUB_OUTPUT"
+
+      # setup-python cannot install on a self-hosted Mac (its installer writes to
+      # /Users/runner); uv keeps Python in the runner user's home and the venv in the job temp.
+      - uses: astral-sh/setup-uv@v6
+      - name: Python
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/venv"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Set version
+        id: version
+        env:
+          CONFIG: ${{ inputs.config }}
+          VERSION: ${{ inputs.version }}
+          BUMP: ${{ inputs.bump }}
+        run: |
+          if [ "$CONFIG" = "Release" ]; then
+            python .unity-ci/scripts/set_version.py --version "$VERSION" --bump "$BUMP"
+          else
+            python .unity-ci/scripts/set_version.py --current
+          fi
+
+      - name: Commit and tag
+        id: tag
+        env:
+          CONFIG: ${{ inputs.config }}
+          VERSION: ${{ steps.version.outputs.version }}
+          CODE: ${{ steps.version.outputs.code }}
+          CHANGED: ${{ steps.version.outputs.changed }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ "$CONFIG" = "Release" ]; then
+            tag="v$VERSION"
+          else
+            tag="v$VERSION-debug.$GITHUB_RUN_NUMBER"
+          fi
+          if [ "$CHANGED" = "true" ]; then
+            git commit -am "Release $VERSION ($CODE)"
+            git push origin HEAD
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" > /dev/null; then
+            echo "Tag $tag already exists, rebuilding it"
+          else
+            git tag "$tag"
+            git push origin "$tag"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  android:
+    needs: version
+    if: inputs.platform != 'ios'
+    runs-on: [self-hosted, macOS]
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+
+      - uses: actions/checkout@v4
+        with:
+          repository: yevhenii-sir/unity-ci
+          ref: ${{ inputs.unity_ci_ref }}
+          path: .unity-ci
+          sparse-checkout: scripts
+
+      - uses: astral-sh/setup-uv@v6
+      - name: Python
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/venv"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+          uv pip install --python "$RUNNER_TEMP/venv" -r .unity-ci/scripts/requirements.txt
+
+      - name: Build on RunPod
+        env:
+          RUNPOD_JOB_FILE: ${{ runner.temp }}/runpod-job-id
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          PROJECT_CONFIG: .github/unity-ci.json
+          UNITY_VERSION: ${{ needs.version.outputs.unity }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+          GITHUB_TOKEN: ${{ github.token }}
+          PLATFORM: android
+          BUILD_CONFIG: ${{ inputs.config }}
+          PLAY_UPLOAD: ${{ inputs.play_upload }}
+          PLAY_TRACK: ${{ inputs.track }}
+          PLAY_STATUS: ${{ inputs.status }}
+        run: python .unity-ci/scripts/request_build.py
+
+      # Cancelling the run kills the waiting script, but the RunPod job keeps building.
+      - name: Cancel the RunPod job
+        if: cancelled()
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          RUNPOD_JOB_FILE: ${{ runner.temp }}/runpod-job-id
+          UNITY_VERSION: ${{ needs.version.outputs.unity }}
+          PLATFORM: android
+        run: |
+          if [ -f "$RUNPOD_JOB_FILE" ]; then
+            python .unity-ci/scripts/request_build.py --cancel "$(cat "$RUNPOD_JOB_FILE")"
+          fi
+
+  ios-export:
+    needs: version
+    if: inputs.platform != 'android' && inputs.config == 'Release'
+    runs-on: [self-hosted, macOS]
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+
+      - uses: actions/checkout@v4
+        with:
+          repository: yevhenii-sir/unity-ci
+          ref: ${{ inputs.unity_ci_ref }}
+          path: .unity-ci
+          sparse-checkout: scripts
+
+      # ios_archive.sh deletes the archive after a successful upload, so one left in the
+      # release is from a failed Mac step and can be reused: the tag pins the same code.
+      - name: Reuse an exported Xcode project
+        id: existing
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          url="https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG"
+          assets=$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" "$url" 2>/dev/null |
+            python3 -c 'import json, sys; [print(a["name"]) for a in json.load(sys.stdin)["assets"]]' || true)
+          if grep -qx "Xcode-$RELEASE_TAG.tar.gz" <<< "$assets"; then
+            echo "Xcode-$RELEASE_TAG.tar.gz is already in the release, skipping the export"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: astral-sh/setup-uv@v6
+        if: steps.existing.outputs.found != 'true'
+      - name: Python
+        if: steps.existing.outputs.found != 'true'
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/venv"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+          uv pip install --python "$RUNNER_TEMP/venv" -r .unity-ci/scripts/requirements.txt
+
+      - name: Export the Xcode project on RunPod
+        if: steps.existing.outputs.found != 'true'
+        env:
+          RUNPOD_JOB_FILE: ${{ runner.temp }}/runpod-job-id
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          PROJECT_CONFIG: .github/unity-ci.json
+          UNITY_VERSION: ${{ needs.version.outputs.unity }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+          GITHUB_TOKEN: ${{ github.token }}
+          PLATFORM: ios
+          # Unique per run, so re-uploading the same version never repeats a build number.
+          IOS_BUILD_NUMBER: ${{ needs.version.outputs.code }}.${{ github.run_number }}
+        run: python .unity-ci/scripts/request_build.py
+
+      - name: Cancel the RunPod job
+        if: cancelled()
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          RUNPOD_JOB_FILE: ${{ runner.temp }}/runpod-job-id
+          UNITY_VERSION: ${{ needs.version.outputs.unity }}
+          PLATFORM: ios
+        run: |
+          if [ -f "$RUNPOD_JOB_FILE" ]; then
+            python .unity-ci/scripts/request_build.py --cancel "$(cat "$RUNPOD_JOB_FILE")"
+          fi
+
+  ios:
+    needs: [version, ios-export]
+    runs-on: [self-hosted, macOS]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: yevhenii-sir/unity-ci
+          ref: ${{ inputs.unity_ci_ref }}
+          sparse-checkout: scripts
+
+      - name: Build and upload to TestFlight
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+          TEAM_ID: ${{ needs.version.outputs.team_id }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          IOS_DIST_P12: ${{ secrets.IOS_DIST_P12 }}
+          IOS_DIST_P12_PASSWORD: ${{ secrets.IOS_DIST_P12_PASSWORD }}
+        run: bash scripts/ios_archive.sh
