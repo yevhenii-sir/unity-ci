@@ -1,0 +1,11 @@
+{
+  "name": "com.yevhenii.unity-ci",
+  "version": "1.0.0",
+  "displayName": "Unity CI",
+  "description": "Android and iOS builders for the unity-ci release pipeline (GitHub Actions, RunPod, Google Play, App Store Connect) and a setup page that writes the project's GitHub workflow.",
+  "unity": "6000.0",
+  "author": {
+    "name": "Yevhenii Sirenko",
+    "url": "https://github.com/yevhenii-sir/unity-ci"
+  }
+}

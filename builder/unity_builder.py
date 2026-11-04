@@ -21,7 +21,7 @@ from runpod import App, Secret
 
 IMAGE = "ghcr.io/yevhenii-sir/unity-runpod:ubuntu-{}"
 # Printed first in every build log, to tell which deployed code a worker runs.
-REVISION = "ios-export-1"
+REVISION = "play-upload-1"
 
 # Project secrets live in RunPod with a project prefix; a request names its prefix
 # and the worker maps PREFIX_KEYSTORE_PASS to ANDROID_KEYSTORE_PASS and so on.
@@ -215,19 +215,23 @@ def build(repo: str = "", tag: str = "", github_token: str = "",
                        stream, {"Content-Type": "application/octet-stream", "Content-Length": str(file.stat().st_size)})
             print(f"Attached {file.name} to release {tag}", flush=True)
 
-    # 5. Google Play, with the project's own upload script. It runs on this worker's Python,
-    # whose path includes the deployed dependencies (google-auth, requests).
+    # 5. Google Play: the built-in uploader, or a project's own script ("script"), which runs
+    # on this worker's Python, whose path includes the deployed dependencies (google-auth, requests).
     if play_upload:
         if not play_key:
             raise RuntimeError(f"Play upload requested but {prefix}_PLAY_SERVICE_ACCOUNT is not set")
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as key:
-            key.write(play_key)
-        env["PYTHONPATH"] = os.pathsep.join(path for path in sys.path if path)
-        try:
-            run([sys.executable, str(work / play_upload["script"]), str(output),
-                 "--track", play_upload["track"], "--status", play_upload["status"], "--key", key.name])
-        finally:
-            os.remove(key.name)
+        if play_upload.get("script"):
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as key:
+                key.write(play_key)
+            env["PYTHONPATH"] = os.pathsep.join(path for path in sys.path if path)
+            try:
+                run([sys.executable, str(work / play_upload["script"]), str(output),
+                     "--track", play_upload["track"], "--status", play_upload["status"], "--key", key.name])
+            finally:
+                os.remove(key.name)
+        else:
+            upload_to_play(output, android_package(work), play_upload["track"], play_upload["status"],
+                           json.loads(play_key))
 
     return {
         "artifact": output.name,
@@ -236,6 +240,60 @@ def build(repo: str = "", tag: str = "", github_token: str = "",
         "release_url": release["html_url"] if release else None,
         "play": f"{play_upload['track']} ({play_upload['status']})" if play_upload else None,
     }
+
+
+def android_package(project):
+    """The Android application id from the project's ProjectSettings.asset."""
+    import re
+    text = (project / "ProjectSettings" / "ProjectSettings.asset").read_text(encoding="utf-8")
+    return re.search(r"applicationIdentifier:\s*\n(?:\s+\w+:.*\n)*?\s+Android: (\S+)", text).group(1)
+
+
+def upload_to_play(aab, package, track, status, service_account):
+    """Upload an AAB to Google Play in one edit and assign it to the track; the edit is
+    discarded if any step fails."""
+    import json
+    from google.auth.transport.requests import AuthorizedSession
+    from google.oauth2 import service_account as accounts
+
+    api = f"https://androidpublisher.googleapis.com/androidpublisher/v3/applications/{package}"
+    upload_api = f"https://androidpublisher.googleapis.com/upload/androidpublisher/v3/applications/{package}"
+    credentials = accounts.Credentials.from_service_account_info(
+        service_account, scopes=["https://www.googleapis.com/auth/androidpublisher"])
+    session = AuthorizedSession(credentials)
+
+    def check(response, action):
+        if response.ok:
+            return response.json() if response.content else {}
+        try:
+            message = response.json()["error"]["message"]
+        except (ValueError, KeyError):
+            message = response.text
+        raise RuntimeError(f"Play: {action} failed ({response.status_code}): {message}")
+
+    size = aab.stat().st_size
+    print(f"Uploading {aab.name} ({size / 1048576:.1f} MB) to Google Play {package}", flush=True)
+    edit_id = check(session.post(f"{api}/edits"), "create edit")["id"]
+    try:
+        init = session.post(
+            f"{upload_api}/edits/{edit_id}/bundles",
+            params={"uploadType": "resumable", "ackBundleInstallationWarning": "true"},
+            headers={"X-Upload-Content-Type": "application/octet-stream", "X-Upload-Content-Length": str(size)})
+        check(init, "upload init")
+        with aab.open("rb") as stream:
+            bundle = check(session.put(init.headers["Location"], data=stream, timeout=1800, headers={
+                "Content-Type": "application/octet-stream", "Content-Length": str(size)}), "bundle upload")
+        version_code = bundle["versionCode"]
+        if track:
+            release = {"versionCodes": [str(version_code)], "status": status}
+            check(session.put(f"{api}/edits/{edit_id}/tracks/{track}",
+                              data=json.dumps({"track": track, "releases": [release]}),
+                              headers={"Content-Type": "application/json"}), f"assign to {track}")
+        check(session.post(f"{api}/edits/{edit_id}:commit"), "commit")
+    except Exception:
+        session.delete(f"{api}/edits/{edit_id}")
+        raise
+    print(f"Uploaded version code {version_code} to Play {track or 'bundle library'} ({status})", flush=True)
 
 
 # One endpoint per Unity version and target module.

@@ -8,8 +8,8 @@ RUNPOD_JOB_FILE.
 `request_build.py --cancel JOB_ID` cancels a build job (PLATFORM picks the endpoint).
 
 Android: the builder clones the tag and runs the project's build method. Release attaches
-the build to the GitHub Release of the tag and, when the project has a play_script,
-uploads the AAB to Google Play; Debug attaches the APK to a prerelease.
+the build to the GitHub Release of the tag and uploads the AAB to Google Play when the
+project sets play_upload (or its own play_script); Debug attaches the APK to a prerelease.
 iOS: the builder attaches the exported Xcode project as Xcode-<tag>.tar.gz;
 scripts/ios_archive.sh on the Mac builds and uploads it.
 """
@@ -45,10 +45,13 @@ def android_request(config):
     build = os.environ.get("BUILD_CONFIG") or "Release"
     release = build == "Release"
     play_upload = None
-    if release and android.get("play_script") and os.environ.get("PLAY_UPLOAD", "true") != "false":
-        play_upload = {"script": android["play_script"],
-                       "track": os.environ.get("PLAY_TRACK") or "internal",
+    wants_play = android.get("play_upload") or android.get("play_script")
+    if release and wants_play and os.environ.get("PLAY_UPLOAD", "true") != "false":
+        # Without play_script the builder uploads with its own uploader.
+        play_upload = {"track": os.environ.get("PLAY_TRACK") or "internal",
                        "status": os.environ.get("PLAY_STATUS") or "draft"}
+        if android.get("play_script"):
+            play_upload["script"] = android["play_script"]
     target = f"Play {play_upload['track']} ({play_upload['status']})" if play_upload else "no Play upload"
     return f"{build}, {target}", dict(
         build_method=android["build_method"],
