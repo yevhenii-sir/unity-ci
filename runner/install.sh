@@ -47,6 +47,15 @@ cat > "$PLIST" <<EOF
 </plist>
 EOF
 
-launchctl bootout "gui/$(id -u)/$AGENT" 2>/dev/null || true
+service="gui/$(id -u)/$AGENT"
+if launchctl print "$service" > /dev/null 2>&1; then
+  launchctl bootout "$service" || true
+  # bootout returns before the service is gone, and bootstrap fails with error 5 until then.
+  for _ in $(seq 1 30); do
+    launchctl print "$service" > /dev/null 2>&1 || break
+    sleep 1
+  done
+fi
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
+launchctl print "$service" | grep -E "^\s*(state|pid) =" || true
 echo "Dispatcher running; log: $LOGS/dispatcher.log"
