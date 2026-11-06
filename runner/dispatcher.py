@@ -283,7 +283,8 @@ class Dispatcher:
         LOGS.mkdir(parents=True, exist_ok=True)
         with (LOGS / f"{name}.log").open("w") as output:
             process = subprocess.Popen([str(RUNNER / "run.sh"), "--jitconfig", jit["encoded_jit_config"]],
-                                       cwd=RUNNER, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+                                       cwd=RUNNER, env=runner_env(), stdout=output, stderr=subprocess.STDOUT,
+                                       start_new_session=True)
         self.runners.append({"name": name, "id": jit["runner"]["id"], "repo": repo, "slot": slot,
                              "pid": process.pid, "started": time.time(), "busy": False, "process": process})
         self.save_state()
@@ -379,6 +380,16 @@ class Dispatcher:
                 time.sleep(1)
         # Running jobs keep going; the next start picks their runners up from the state file.
         log("Dispatcher stopped")
+
+
+def runner_env():
+    """launchd starts the dispatcher with a bare PATH; jobs get the one captured in .path, as
+    runsvc.sh does for a runner service (the runner loads .env itself)."""
+    env = dict(os.environ)
+    path_file = RUNNER / ".path"
+    if path_file.exists() and path_file.read_text(encoding="utf-8").strip():
+        env["PATH"] = path_file.read_text(encoding="utf-8").strip()
+    return env
 
 
 def pid_alive(pid):
